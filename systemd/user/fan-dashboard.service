@@ -1,0 +1,10 @@
+[Unit]
+Description=Local fan telemetry dashboard
+
+[Service]
+ExecStart=%h/bin/fan-dashboard --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
