@@ -182,16 +182,26 @@ def render_page(data):
     table {{
       width: 100%;
       border-collapse: collapse;
+      table-layout: fixed;
       background: #181c24;
       border: 1px solid #2a3140;
       border-radius: 8px;
       overflow: hidden;
     }}
+    .gpu-table th:nth-child(1), .gpu-table td:nth-child(1) {{ width: 12%; }}
+    .gpu-table th:nth-child(2), .gpu-table td:nth-child(2) {{ width: 40%; }}
+    .gpu-table th:nth-child(3), .gpu-table td:nth-child(3) {{ width: 10%; }}
+    .gpu-table th:nth-child(4), .gpu-table td:nth-child(4) {{ width: 10%; }}
+    .gpu-table th:nth-child(5), .gpu-table td:nth-child(5) {{ width: 16%; }}
+    .gpu-table th:nth-child(6), .gpu-table td:nth-child(6) {{ width: 12%; }}
+    .fan-table th, .fan-table td {{ width: 33.333%; }}
     th, td {{
       padding: 12px 14px;
       text-align: left;
       border-bottom: 1px solid #2a3140;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }}
     th {{
       color: #aeb9ca;
@@ -212,7 +222,8 @@ def render_page(data):
     @media (max-width: 680px) {{
       body {{ padding: 14px; }}
       header {{ display: block; }}
-      table {{ display: block; overflow-x: auto; }}
+      table {{ display: block; overflow-x: auto; table-layout: auto; }}
+      th, td {{ overflow: visible; }}
     }}
   </style>
 </head>
@@ -224,7 +235,7 @@ def render_page(data):
     </header>
 
     <h2>GPU Fans</h2>
-    <table>
+    <table class="gpu-table">
       <thead>
         <tr>
           <th>Slot</th>
@@ -239,7 +250,7 @@ def render_page(data):
     </table>
 
     <h2>Motherboard Fans</h2>
-    <table>
+    <table class="fan-table">
       <thead>
         <tr>
           <th>Sensor</th>
