@@ -47,6 +47,15 @@ systemctl --user restart fan-dashboard.service
 
 Some motherboards need a specific kernel module or BIOS setting before fan RPMs appear.
 
+For example, an MSI X99A RAIDER exposes its Nuvoton `nct6792` monitoring chip through the `nct6775` kernel module:
+
+```bash
+sudo modprobe nct6775
+printf 'nct6775\n' | sudo tee /etc/modules-load.d/fan-dashboard.conf
+```
+
+After loading the module, restart the dashboard or wait for the next browser refresh.
+
 ## Manual Run
 
 ```bash
