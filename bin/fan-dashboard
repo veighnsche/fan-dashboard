@@ -4,12 +4,36 @@ import csv
 import html
 import json
 import os
+import shutil
 import subprocess
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
 HWMON_ROOT = Path("/sys/class/hwmon")
+EXCLUDED_FILESYSTEMS = {
+    "autofs",
+    "bpf",
+    "cgroup",
+    "cgroup2",
+    "configfs",
+    "debugfs",
+    "devpts",
+    "devtmpfs",
+    "efivarfs",
+    "fusectl",
+    "hugetlbfs",
+    "mqueue",
+    "overlay",
+    "proc",
+    "pstore",
+    "securityfs",
+    "squashfs",
+    "sysfs",
+    "tmpfs",
+    "tracefs",
+}
 
 
 def read_text(path):
@@ -29,6 +53,89 @@ def read_float(path, scale=1.0):
         return None
 
 
+def pct(part, whole):
+    if not whole:
+        return 0.0
+    return round((part / whole) * 100, 1)
+
+
+def format_bytes(num_bytes):
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if value < 1024 or unit == "PiB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def read_cpu_times():
+    try:
+        with Path("/proc/stat").open(encoding="utf-8") as stat_file:
+            line = stat_file.readline().strip()
+    except OSError:
+        return None
+    parts = line.split()
+    if not parts or parts[0] != "cpu":
+        return None
+    values = [int(value) for value in parts[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    total = sum(values)
+    return idle, total
+
+
+def cpu_usage_percent():
+    first = read_cpu_times()
+    if first is None:
+        return None
+    time.sleep(0.15)
+    second = read_cpu_times()
+    if second is None:
+        return None
+    idle_delta = second[0] - first[0]
+    total_delta = second[1] - first[1]
+    if total_delta <= 0:
+        return None
+    return round(100 * (1 - idle_delta / total_delta), 1)
+
+
+def memory_usage():
+    meminfo = {}
+    for line in (read_text("/proc/meminfo") or "").splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.strip().split()
+        if parts:
+            meminfo[key] = int(parts[0]) * 1024
+
+    total = meminfo.get("MemTotal")
+    available = meminfo.get("MemAvailable")
+    if total is None or available is None:
+        return None
+    used = total - available
+    return {
+        "used_bytes": used,
+        "available_bytes": available,
+        "total_bytes": total,
+        "used": format_bytes(used),
+        "available": format_bytes(available),
+        "total": format_bytes(total),
+        "used_percent": pct(used, total),
+    }
+
+
+def load_average():
+    try:
+        one, five, fifteen = os.getloadavg()
+    except OSError:
+        return None
+    return {
+        "one": round(one, 2),
+        "five": round(five, 2),
+        "fifteen": round(fifteen, 2),
+        "cpu_count": os.cpu_count() or 1,
+    }
+
+
 def nvidia_gpus():
     fields = [
         "index",
@@ -37,6 +144,8 @@ def nvidia_gpus():
         "fan.speed",
         "power.draw",
         "utilization.gpu",
+        "memory.used",
+        "memory.total",
     ]
     cmd = [
         "nvidia-smi",
@@ -69,6 +178,9 @@ def nvidia_gpus():
                 "fan_percent": values[3],
                 "power_w": values[4],
                 "utilization_percent": values[5],
+                "memory_used_mib": values[6],
+                "memory_total_mib": values[7],
+                "memory_percent": pct(float(values[6]), float(values[7])),
             }
         )
     return rows
@@ -98,9 +210,56 @@ def hwmon_fans():
     return fans
 
 
+def storage_usage():
+    mounts = []
+    seen_mountpoints = set()
+    seen_devices = set()
+    for line in (read_text("/proc/mounts") or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        source, mountpoint, fstype = parts[:3]
+        if fstype in EXCLUDED_FILESYSTEMS or mountpoint in seen_mountpoints:
+            continue
+        try:
+            device = os.stat(mountpoint).st_dev
+            usage = shutil.disk_usage(mountpoint)
+        except OSError:
+            continue
+        if usage.total <= 0 or device in seen_devices:
+            continue
+        seen_mountpoints.add(mountpoint)
+        seen_devices.add(device)
+        mounts.append(
+            {
+                "source": source.replace("\\040", " "),
+                "mountpoint": mountpoint.replace("\\040", " "),
+                "fstype": fstype,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+                "total_bytes": usage.total,
+                "used": format_bytes(usage.used),
+                "free": format_bytes(usage.free),
+                "total": format_bytes(usage.total),
+                "used_percent": pct(usage.used, usage.total),
+            }
+        )
+    return sorted(mounts, key=lambda item: item["mountpoint"])
+
+
+def system_stats():
+    return {
+        "cpu_percent": cpu_usage_percent(),
+        "load_average": load_average(),
+        "memory": memory_usage(),
+        "storage": storage_usage(),
+    }
+
+
 def snapshot():
     return {
         "hostname": os.uname().nodename,
+        "system": system_stats(),
         "gpus": nvidia_gpus(),
         "fans": hwmon_fans(),
     }
@@ -112,7 +271,58 @@ def cell(value, suffix=""):
     return f"{html.escape(str(value))}{suffix}"
 
 
+def meter(value):
+    try:
+        percent = max(0.0, min(100.0, float(value)))
+    except (TypeError, ValueError):
+        return ""
+    return f'<div class="meter"><span style="width: {percent}%"></span></div>'
+
+
 def render_page(data):
+    system = data["system"]
+    memory = system["memory"]
+    load = system["load_average"]
+    storage = system["storage"]
+    total_storage = sum(item["total_bytes"] for item in storage)
+    used_storage = sum(item["used_bytes"] for item in storage)
+    storage_percent = pct(used_storage, total_storage)
+    summary_cards = [
+        {
+            "label": "CPU",
+            "value": cell(system["cpu_percent"], "%"),
+            "sub": (
+                f"load {load['one']} / {load['five']} / {load['fifteen']}"
+                if load
+                else "load n/a"
+            ),
+            "percent": system["cpu_percent"],
+        },
+        {
+            "label": "RAM",
+            "value": cell(memory["used"] if memory else None),
+            "sub": f"of {memory['total']}" if memory else "total n/a",
+            "percent": memory["used_percent"] if memory else None,
+        },
+        {
+            "label": "Storage",
+            "value": cell(format_bytes(used_storage)),
+            "sub": f"of {format_bytes(total_storage)}",
+            "percent": storage_percent,
+        },
+    ]
+    summary_html = "\n".join(
+        f"""
+        <section class="stat">
+          <div class="stat-label">{html.escape(card["label"])}</div>
+          <div class="stat-value">{card["value"]}</div>
+          <div class="stat-sub">{html.escape(card["sub"])}</div>
+          {meter(card["percent"])}
+        </section>
+        """
+        for card in summary_cards
+    )
+
     gpu_rows = "\n".join(
         f"""
         <tr>
@@ -120,12 +330,13 @@ def render_page(data):
           <td>{html.escape(gpu["name"])}</td>
           <td>{cell(gpu["fan_percent"], "%")}</td>
           <td>{cell(gpu["temperature_c"], " C")}</td>
+          <td>{cell(gpu["memory_used_mib"], " MiB")} / {cell(gpu["memory_total_mib"], " MiB")}{meter(gpu["memory_percent"])}</td>
           <td>{cell(gpu["power_w"], " W")}</td>
           <td>{cell(gpu["utilization_percent"], "%")}</td>
         </tr>
         """
         for gpu in data["gpus"]
-    ) or '<tr><td colspan="6" class="muted">No NVIDIA GPU fan telemetry found.</td></tr>'
+    ) or '<tr><td colspan="7" class="muted">No NVIDIA GPU telemetry found.</td></tr>'
 
     fan_rows = "\n".join(
         f"""
@@ -138,13 +349,27 @@ def render_page(data):
         for fan in data["fans"]
     ) or '<tr><td colspan="3" class="muted">No motherboard fan RPMs exposed yet.</td></tr>'
 
+    storage_rows = "\n".join(
+        f"""
+        <tr>
+          <td>{html.escape(item["mountpoint"])}</td>
+          <td>{html.escape(item["fstype"])}</td>
+          <td>{cell(item["used"])}</td>
+          <td>{cell(item["free"])}</td>
+          <td>{cell(item["total"])}</td>
+          <td>{cell(item["used_percent"], "%")}{meter(item["used_percent"])}</td>
+        </tr>
+        """
+        for item in storage
+    ) or '<tr><td colspan="6" class="muted">No storage mounts found.</td></tr>'
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="5">
-  <title>Fan Dashboard</title>
+  <title>System Dashboard</title>
   <style>
     :root {{
       color-scheme: dark;
@@ -179,6 +404,47 @@ def render_page(data):
       color: #b8c3d6;
       text-transform: uppercase;
     }}
+    .stats {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 28px;
+    }}
+    .stat {{
+      min-width: 0;
+      background: #181c24;
+      border: 1px solid #2a3140;
+      border-radius: 8px;
+      padding: 14px;
+    }}
+    .stat-label {{
+      color: #aeb9ca;
+      font-size: 0.82rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }}
+    .stat-value {{
+      margin-top: 8px;
+      font-size: 1.45rem;
+      font-weight: 700;
+    }}
+    .stat-sub {{
+      margin-top: 4px;
+      color: #8793a6;
+      font-size: 0.9rem;
+    }}
+    .meter {{
+      height: 6px;
+      margin-top: 9px;
+      background: #2a3140;
+      border-radius: 999px;
+      overflow: hidden;
+    }}
+    .meter span {{
+      display: block;
+      height: 100%;
+      background: #6aa6ff;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -188,13 +454,20 @@ def render_page(data):
       border-radius: 8px;
       overflow: hidden;
     }}
-    .gpu-table th:nth-child(1), .gpu-table td:nth-child(1) {{ width: 12%; }}
-    .gpu-table th:nth-child(2), .gpu-table td:nth-child(2) {{ width: 40%; }}
-    .gpu-table th:nth-child(3), .gpu-table td:nth-child(3) {{ width: 10%; }}
-    .gpu-table th:nth-child(4), .gpu-table td:nth-child(4) {{ width: 10%; }}
-    .gpu-table th:nth-child(5), .gpu-table td:nth-child(5) {{ width: 16%; }}
-    .gpu-table th:nth-child(6), .gpu-table td:nth-child(6) {{ width: 12%; }}
+    .gpu-table th:nth-child(1), .gpu-table td:nth-child(1) {{ width: 10%; }}
+    .gpu-table th:nth-child(2), .gpu-table td:nth-child(2) {{ width: 28%; }}
+    .gpu-table th:nth-child(3), .gpu-table td:nth-child(3) {{ width: 8%; }}
+    .gpu-table th:nth-child(4), .gpu-table td:nth-child(4) {{ width: 9%; }}
+    .gpu-table th:nth-child(5), .gpu-table td:nth-child(5) {{ width: 21%; }}
+    .gpu-table th:nth-child(6), .gpu-table td:nth-child(6) {{ width: 13%; }}
+    .gpu-table th:nth-child(7), .gpu-table td:nth-child(7) {{ width: 11%; }}
     .fan-table th, .fan-table td {{ width: 33.333%; }}
+    .storage-table th:nth-child(1), .storage-table td:nth-child(1) {{ width: 27%; }}
+    .storage-table th:nth-child(2), .storage-table td:nth-child(2) {{ width: 12%; }}
+    .storage-table th:nth-child(3), .storage-table td:nth-child(3) {{ width: 14%; }}
+    .storage-table th:nth-child(4), .storage-table td:nth-child(4) {{ width: 14%; }}
+    .storage-table th:nth-child(5), .storage-table td:nth-child(5) {{ width: 14%; }}
+    .storage-table th:nth-child(6), .storage-table td:nth-child(6) {{ width: 19%; }}
     th, td {{
       padding: 12px 14px;
       text-align: left;
@@ -222,6 +495,7 @@ def render_page(data):
     @media (max-width: 680px) {{
       body {{ padding: 14px; }}
       header {{ display: block; }}
+      .stats {{ grid-template-columns: 1fr; }}
       table {{ display: block; overflow-x: auto; table-layout: auto; }}
       th, td {{ overflow: visible; }}
     }}
@@ -230,9 +504,11 @@ def render_page(data):
 <body>
   <main>
     <header>
-      <h1>Fan Dashboard</h1>
+      <h1>System Dashboard</h1>
       <div class="muted">{html.escape(data["hostname"])} · refreshes every 5s</div>
     </header>
+
+    <div class="stats">{summary_html}</div>
 
     <h2>GPU Fans</h2>
     <table class="gpu-table">
@@ -242,6 +518,7 @@ def render_page(data):
           <th>Name</th>
           <th>Fan</th>
           <th>Temp</th>
+          <th>VRAM</th>
           <th>Power</th>
           <th>Load</th>
         </tr>
@@ -259,6 +536,21 @@ def render_page(data):
         </tr>
       </thead>
       <tbody>{fan_rows}</tbody>
+    </table>
+
+    <h2>Storage</h2>
+    <table class="storage-table">
+      <thead>
+        <tr>
+          <th>Mount</th>
+          <th>Type</th>
+          <th>Used</th>
+          <th>Free</th>
+          <th>Total</th>
+          <th>Use</th>
+        </tr>
+      </thead>
+      <tbody>{storage_rows}</tbody>
     </table>
 
     <p class="note">
@@ -298,13 +590,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tiny fan telemetry dashboard.")
+    parser = argparse.ArgumentParser(description="Tiny system telemetry dashboard.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Fan dashboard listening on http://{args.host}:{args.port}")
+    print(f"System dashboard listening on http://{args.host}:{args.port}")
     server.serve_forever()
 
 

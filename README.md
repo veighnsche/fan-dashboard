@@ -1,11 +1,15 @@
-# Fan Dashboard
+# System Dashboard
 
-Tiny local web dashboard for checking fan-related telemetry before a machine gets loud enough to bother people nearby.
+Tiny local web dashboard for checking system telemetry before a machine gets loud enough to bother people nearby.
 
 It shows:
 
+- CPU usage and load average
+- RAM usage
 - NVIDIA GPU fan percentage, temperature, power draw, and utilization via `nvidia-smi`
+- NVIDIA VRAM usage via `nvidia-smi`
 - Motherboard fan RPMs exposed by Linux under `/sys/class/hwmon`
+- Storage usage for real mounted filesystems
 - A JSON endpoint at `/json`
 
 The server binds to `127.0.0.1` by default, so the recommended remote access pattern is an SSH tunnel:
